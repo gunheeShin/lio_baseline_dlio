@@ -11,6 +11,58 @@
  ***********************************************************/
 
 #include "dlio/odom.h"
+#include "data_recorder.h"
+#include <std_srvs/Trigger.h>
+
+std::shared_ptr<DataRecorder<RecordPointType>> recorder_ptr_;
+ros::ServiceServer recorder_server_;
+// rosservice call /robot/dlio_odom/save_data
+std::string result_dir, dataset, data_id, test_topic, algorithm, param_set_name;
+std::vector<std::string> lidar_names;
+std::vector<int> lidar_indices;
+std::string save_dir;
+
+double lidar_end_time = 0.0;
+
+void recordRamUsage(double stamp)
+{
+    pid_t pid = getpid();
+    std::string path = "/proc/" + std::to_string(pid) + "/status";
+    std::ifstream file(path);
+    std::string line;
+    double mem_usage = 0.0;
+    while (std::getline(file, line))
+    {
+        if (line.find("VmRSS:") == 0)
+        {
+            mem_usage = std::stod(line.substr(6)) / 1024.0; // Convert to MB
+            break;
+        }
+    }
+
+    recorder_ptr_->recordValue("RAM_usage", stamp, mem_usage);
+}
+
+bool data_recorder_callback(std_srvs::Trigger::Request &req, std_srvs::Trigger::Response &res)
+{
+    if (recorder_ptr_ != nullptr)
+    {
+
+        recorder_ptr_->savePose();
+        recorder_ptr_->saveTime();
+        recorder_ptr_->saveValue();
+        recorder_ptr_->saveStatus("Finished");
+
+        res.success = true;
+        res.message = "Data saved successfully.";
+    }
+    else
+    {
+        res.success = false;
+        res.message = "Recorder pointer is null, cannot save data.";
+    }
+    return true;
+}
 
 dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
 
@@ -158,6 +210,12 @@ dlio::OdomNode::OdomNode(ros::NodeHandle node_handle) : nh(node_handle) {
   }
   fclose(file);
 
+  recorder_ptr_.reset(new DataRecorder<RecordPointType>());
+  recorder_ptr_->init(save_dir, 0, true);
+
+  recorder_server_ = this->nh.advertiseService("save_data", data_recorder_callback);
+  //----------------------------------------------------------------------------------------------------
+
 }
 
 dlio::OdomNode::~OdomNode() {}
@@ -302,6 +360,40 @@ void dlio::OdomNode::getParams() {
   ros::param::param<double>("~dlio/odom/geo/gbias_max", this->geo_gbias_max_, 1.0);
 
   ros::param::param<bool>("~dlio/verbose", this->verbose, true);
+
+  //----------------------------------------------------------------------------------------------------
+  // Data Recorder Configurations
+  ros::param::param<std::string>("~dlio/data_recorder/result_dir", result_dir, "/");
+  ros::param::param<std::string>("~dlio/data_recorder/dataset", dataset, "dataset");
+  ros::param::param<std::string>("~dlio/data_recorder/data_id", data_id, "data_id");
+  ros::param::param<std::string>("~dlio/data_recorder/test_topic", test_topic, "test_topic");
+  ros::param::param<std::string>("~dlio/data_recorder/algorithm", algorithm, "fastlio");
+  ros::param::param<std::string>("~dlio/data_recorder/param_set_name", param_set_name, "default");
+  ros::param::param<std::vector<std::string>>("~dlio/data_recorder/lidar_names", lidar_names,
+                                      std::vector<std::string>());
+  ros::param::param<std::vector<int>>("~dlio/data_recorder/lidar_indices", lidar_indices, std::vector<int>());
+
+  std::string lidars_combination = "";
+  for (auto &index : lidar_indices)
+  {
+      lidars_combination += lidar_names[index] + "_";
+  }
+  lidars_combination = lidars_combination.substr(0, lidars_combination.size() - 1);
+
+  save_dir = result_dir + "/" + dataset + "/" + data_id + "/" + test_topic + "/" + lidars_combination
+              + "/" + algorithm  + "/" + param_set_name;
+
+  // Check variables
+  std::cout << "\033[32m" << "Data Recorder Configurations:" << std::endl;
+  std::cout << "Result Directory: " << result_dir << std::endl;
+  std::cout << "Data ID: " << data_id << std::endl;
+  std::cout << "Test Topic: " << test_topic << std::endl;
+  std::cout << "Parameter Set Name: " << param_set_name << std::endl;
+  std::cout << "LiDAR Comb.: " << lidars_combination << std::endl;
+  std::cout << "Save Directory: " << save_dir << std::endl;
+  std::cout << "\033[0m" << std::endl;
+
+
 }
 
 void dlio::OdomNode::start() {
@@ -538,7 +630,6 @@ void dlio::OdomNode::preprocessPoints() {
 
   // Deskew the original dlio-type scan
   if (this->deskew_) {
-
     this->deskewPointcloud();
 
     if (!this->first_valid_scan) {
@@ -546,7 +637,6 @@ void dlio::OdomNode::preprocessPoints() {
     }
 
   } else {
-
     this->scan_stamp = this->scan_header_stamp.toSec();
 
     // don't process scans until IMU data is present
@@ -676,7 +766,8 @@ void dlio::OdomNode::deskewPointcloud() {
 
   int median_pt_index = timestamps.size() / 2;
   this->scan_stamp = timestamps[median_pt_index]; // set this->scan_stamp to the timestamp of the median point
-
+  lidar_end_time = timestamps.back();
+  
   // don't process scans until IMU data is present
   if (!this->first_valid_scan) {
     if (this->imu_buffer.empty() || this->scan_stamp <= this->imu_buffer.back().stamp) {
@@ -838,6 +929,14 @@ void dlio::OdomNode::callbackPointCloud(const sensor_msgs::PointCloud2ConstPtr& 
   this->lidar_rates.push_back( 1. / (this->scan_stamp - this->prev_scan_stamp) );
   this->prev_scan_stamp = this->scan_stamp;
   this->elapsed_time = this->scan_stamp - this->first_scan_stamp;
+
+  Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+  pose.block<3, 3>(0, 0) = this->state.q.toRotationMatrix().cast<double>();
+  pose.block<3, 1>(0, 3) = Eigen::Vector3d(this->state.p[0], this->state.p[1], this->state.p[2]);
+
+  Eigen::Matrix<double, 6, 6> pose_cov = Eigen::Matrix<double, 6, 6>::Identity();
+
+  recorder_ptr_->recordPose(lidar_end_time, std::tie(pose, pose_cov));
 
   // Publish stuff to ROS
   pcl::PointCloud<PointType>::ConstPtr published_cloud;
